@@ -1,0 +1,323 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "pragmas.h"
+#include "cabinet.h"
+#include "thermal.h"
+#include "display.h"
+
+#define RB_SIZE 64u
+
+typedef struct {
+    volatile uint8_t head;
+    volatile uint8_t tail;
+    volatile uint8_t data[RB_SIZE];
+} ByteRing;
+
+static volatile ByteRing rx_ring;
+static volatile ByteRing tx_ring;
+
+static uint8_t rb_next(uint8_t index) {
+    index++;
+    if (index >= RB_SIZE) index = 0;
+    return index;
+}
+static uint8_t rb_is_empty(volatile ByteRing *rb) { return rb->head == rb->tail; }
+static uint8_t rb_is_full(volatile ByteRing *rb) { return rb_next(rb->head) == rb->tail; }
+
+static uint8_t rb_push(volatile ByteRing *rb, uint8_t value) {
+    if (rb_is_full(rb)) return 0;
+    rb->data[rb->head] = value;
+    rb->head = rb_next(rb->head);
+    return 1;
+}
+static uint8_t rb_pop(volatile ByteRing *rb, uint8_t *value) {
+    if (rb_is_empty(rb)) return 0;
+    *value = rb->data[rb->tail];
+    rb->tail = rb_next(rb->tail);
+    return 1;
+}
+
+uint8_t uart_rx_available(void) { return !rb_is_empty(&rx_ring); }
+
+uint8_t uart_read_byte(uint8_t *value) { return rb_pop(&rx_ring, value); }
+
+uint8_t uart_write_byte(uint8_t value) {
+    if (!rb_push(&tx_ring, value)) return 0;
+    PIE1bits.TX1IE = 1;
+    return 1;
+}
+
+volatile CabState cab_state = ST_WAITING;
+static volatile uint8_t tick_flag = 0;
+
+typedef enum { CMD_NONE, CMD_CON, CMD_DIS, CMD_LIM } PendKind;
+static volatile PendKind pend_kind = CMD_NONE;
+static volatile uint8_t  pend_arg  = 0;
+
+static volatile uint8_t ack_pending = 0;
+static volatile uint8_t ack_code    = 0;
+
+void eusart_init(void) {
+    TRISCbits.TRISC6 = 1;
+    TRISCbits.TRISC7 = 1;
+
+    BAUDCON1bits.BRG16 = 1;
+    TXSTA1bits.BRGH    = 1;
+    SPBRGH1 = 0;
+    SPBRG1  = 86;
+
+    TXSTA1bits.SYNC = 0;
+    RCSTA1bits.SPEN = 1;
+    TXSTA1bits.TXEN = 1;
+    RCSTA1bits.CREN = 1;
+
+    PIE1bits.RC1IE = 1;
+    PIE1bits.TX1IE = 0;
+}
+
+#define T0_RELOAD_H 0xC2
+#define T0_RELOAD_L 0xF7
+
+void cabinet_tick_init(void) {
+    T0CONbits.T08BIT = 0;
+    T0CONbits.T0CS   = 0;
+    T0CONbits.PSA    = 0;
+    T0CONbits.T0PS2  = 1;
+    T0CONbits.T0PS1  = 0;
+    T0CONbits.T0PS0  = 1;
+    TMR0H = T0_RELOAD_H;
+    TMR0L = T0_RELOAD_L;
+    INTCONbits.TMR0IF = 0;
+    INTCONbits.TMR0IE = 1;
+    T0CONbits.TMR0ON  = 1;
+}
+
+#define FRAME_MAX 8
+static uint8_t frame_buf[FRAME_MAX];
+static uint8_t frame_len  = 0;
+static uint8_t collecting = 0;
+
+static void queue_in_run(PendKind k, uint8_t arg) {
+    pend_kind = k;
+    pend_arg  = arg;
+}
+
+static void dispatch_frame(uint8_t *body, uint8_t len) {
+
+    if (len == 2 && body[0]=='G' && body[1]=='O') {
+        if (cab_state == ST_WAITING) {
+            cab_state = ST_ACTIVE;
+            ack_pending = 1; ack_code = 0;
+            thermal_reset();
+            display_page      = 0;
+            rb6_release_flag  = 0;
+            adc_start_conversion();
+            cabinet_tick_init();
+        }
+        return;
+    }
+    if (len == 3 && body[0]=='E' && body[1]=='N' && body[2]=='D') {
+        if (cab_state == ST_ACTIVE) {
+            uint8_t old_gie = INTCONbits.GIE;
+            INTCONbits.GIE = 0;
+            cab_state = ST_END;
+            T0CONbits.TMR0ON = 0;
+            INTCONbits.TMR0IE = 0;
+            INTCONbits.TMR0IF = 0;
+            tick_flag = 0;
+            ack_pending = 0;
+            pend_kind = CMD_NONE;
+            PIE1bits.TX1IE = 0;
+            TXSTA1bits.TXEN = 0;
+            tx_ring.head = 0;
+            tx_ring.tail = 0;
+            PIE1bits.RC1IE = 0;
+            RCSTA1bits.CREN = 0;
+            rx_ring.head = 0;
+            rx_ring.tail = 0;
+            PIE1bits.ADIE = 0;
+            ADCON0bits.ADON = 0;
+            PIR1bits.ADIF = 0;
+            adc_ready = 0;
+            display_blank();
+            INTCONbits.GIE = old_gie;
+        }
+        return;
+    }
+
+    if (cab_state != ST_ACTIVE) return;
+
+    if (len == 4 && body[0]=='C' && body[1]=='O' && body[2]=='N') {
+        uint8_t p = body[3] - '0';
+        if (p <= 2) queue_in_run(CMD_CON, p);
+        return;
+    }
+    if (len == 4 && body[0]=='D' && body[1]=='I' && body[2]=='S') {
+        uint8_t p = body[3] - '0';
+        if (p <= 2) queue_in_run(CMD_DIS, p);
+        return;
+    }
+    if (len == 5 && body[0]=='L' && body[1]=='I' && body[2]=='M') {
+        uint8_t d0 = body[3] - '0';
+        uint8_t d1 = body[4] - '0';
+        if (d0 <= 9 && d1 <= 9) {
+            uint8_t amps = d0*10 + d1;
+            if (amps==0 || amps==8 || amps==16 || amps==24)
+                queue_in_run(CMD_LIM, amps);
+        }
+        return;
+    }
+}
+
+static void parser_feed(uint8_t b) {
+    if (b == '$') {
+        collecting = 1;
+        frame_len  = 0;
+        return;
+    }
+    if (!collecting) return;
+    if (b == '#') {
+        collecting = 0;
+        dispatch_frame(frame_buf, frame_len);
+        return;
+    }
+    if (frame_len >= FRAME_MAX) {
+        collecting = 0;
+        return;
+    }
+    frame_buf[frame_len++] = b;
+}
+
+static void send_ack(uint8_t code) {
+    char buf[8];
+    sprintf(buf, "$ACK%02u#", (unsigned)code);
+    for (uint8_t i = 0; buf[i]; i++) uart_write_byte((uint8_t)buf[i]);
+}
+
+static void send_sts(void) {
+    char buf[16];
+    uint16_t adc;
+
+    PIE1bits.ADIE = 0;
+    adc = adc_last;
+    PIE1bits.ADIE = 1;
+
+    sprintf(buf, "$STS%c%04u%u%02u#",
+            thermal_mode, (unsigned)adc,
+            (unsigned)(connected_mask & 0x07), (unsigned)limit_effective());
+    for (uint8_t i = 0; buf[i]; i++) uart_write_byte((uint8_t)buf[i]);
+}
+
+static void cabinet_tick(void) {
+    if (cab_state != ST_ACTIVE) return;
+
+    switch (pend_kind) {
+        case CMD_CON: {
+            uint8_t bit = (uint8_t)(1u << pend_arg);
+            if (!(connected_mask & bit)) {
+                connected_mask |= bit;
+                ack_pending = 1; ack_code = 1;
+            }
+            break;
+        }
+        case CMD_DIS: {
+            uint8_t bit = (uint8_t)(1u << pend_arg);
+            if (connected_mask & bit) {
+                connected_mask &= (uint8_t)~bit;
+                ack_pending = 1; ack_code = 2;
+            }
+            break;
+        }
+        case CMD_LIM:
+            if (requested_limit != pend_arg) {
+                requested_limit = pend_arg;
+                ack_pending = 1; ack_code = 3;
+            }
+            break;
+        default: break;
+    }
+    pend_kind = CMD_NONE;
+
+    thermal_update();
+    adc_tick();
+    display_process_button();
+    display_update_buffer();
+
+    if (ack_pending) {
+        send_ack(ack_code);
+        ack_pending = 0;
+    } else {
+        send_sts();
+    }
+}
+
+void __interrupt() isr(void) {
+    if (PIE1bits.RC1IE && PIR1bits.RC1IF) {
+        uint8_t ferr = RCSTA1bits.FERR;
+        if (RCSTA1bits.OERR) {
+            RCSTA1bits.CREN = 0;
+            RCSTA1bits.CREN = 1;
+        }
+        uint8_t byte = RCREG1;
+        if (!ferr && cab_state != ST_END) {
+            (void)rb_push(&rx_ring, byte);
+        }
+    }
+
+    if (PIE1bits.TX1IE && PIR1bits.TX1IF) {
+        uint8_t byte;
+        if (rb_pop(&tx_ring, &byte)) {
+            TXREG1 = byte;
+        } else {
+            PIE1bits.TX1IE = 0;
+        }
+    }
+
+    if (PIE1bits.ADIE && PIR1bits.ADIF) {
+        uint8_t lo = ADRESL;
+        uint8_t hi = ADRESH & 0x03u;
+        adc_last  = (uint16_t)lo | ((uint16_t)hi << 8u);
+        adc_ready = 1u;
+        PIR1bits.ADIF = 0;
+    }
+
+    if (INTCONbits.TMR0IE && INTCONbits.TMR0IF) {
+        TMR0H = T0_RELOAD_H;
+        TMR0L = T0_RELOAD_L;
+        INTCONbits.TMR0IF = 0;
+        tick_flag = 1;
+    }
+
+    if (PIE1bits.TMR1IE && PIR1bits.TMR1IF) {
+        display_timer1_handler();
+    }
+
+    if (INTCONbits.RBIE && INTCONbits.RBIF) {
+        rb6_ioc_handler();
+    }
+}
+
+void main(void) {
+    eusart_init();
+    adc_init();
+    display_init();
+    timer1_display_init();
+    rb6_ioc_init();
+
+    RCONbits.IPEN   = 0;
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE  = 1;
+
+    while (1) {
+        while (uart_rx_available()) {
+            uint8_t byte;
+            uart_read_byte(&byte);
+            parser_feed(byte);
+        }
+        if (tick_flag) {
+            tick_flag = 0;
+            cabinet_tick();
+        }
+    }
+}
